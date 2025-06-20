@@ -226,25 +226,25 @@ class Joiner(AbstractJoiner):
     @execute_as_root
     def _setup_sssd_ldap(self, dc_ip: str, ldap_master: str, ldap_server_name: str, admin_username: str,
                          admin_pw: str, ldap_base: str, kerberos_realm: str, admin_dn: str) -> None:
-        """Configure SSSD for LDAP-only authentication with basic group mapping."""
-        userinfo_logger.info('Configuring SSSD for LDAP-only authentication with group mapping')
+        """Configure SSSD for LDAP-only authentication with minimal configuration."""
+        userinfo_logger.info('Configuring SSSD for LDAP-only authentication with minimal settings')
         
         # Get machine DN and password
         machine_dn, _ = ldap.get_machines_udm(dc_ip, admin_username, admin_pw, admin_dn)
         ldap_password = open('/etc/machine.secret').read().strip()
         
         # Create SSSD config with LDAP as both id_provider and auth_provider
+        # Using minimal configuration to ensure reliability
         os.makedirs('/etc/sssd', exist_ok=True)
         sssd_conf = \
             '[sssd]\n' \
             'config_file_version = 2\n' \
-            'services = nss, pam, sudo\n' \
+            'services = nss, pam\n' \
             'domains = %(kerberos_realm)s\n' \
             '\n' \
             '[nss]\n' \
             'filter_users = root,nobody,halt,sync,shutdown,operator\n' \
             'filter_groups = root\n' \
-            'override_homedir = /home/%%u\n' \
             '\n' \
             '[pam]\n' \
             'reconnection_retries = 3\n' \
@@ -252,9 +252,6 @@ class Joiner(AbstractJoiner):
             '[domain/%(kerberos_realm)s]\n' \
             'id_provider = ldap\n' \
             'auth_provider = ldap\n' \
-            'access_provider = ldap\n' \
-            '\n' \
-            '# LDAP connection settings\n' \
             'ldap_uri = ldap://%(ldap_server_name)s:7389\n' \
             'ldap_search_base = %(ldap_base)s\n' \
             'ldap_tls_reqcert = never\n' \
@@ -262,19 +259,9 @@ class Joiner(AbstractJoiner):
             'ldap_default_bind_dn = %(machines_ldap_dn)s\n' \
             'ldap_default_authtok_type = password\n' \
             'ldap_default_authtok = %(ldap_password)s\n' \
-            '\n' \
-            '# Basic schema settings\n' \
             'ldap_schema = rfc2307bis\n' \
             'ldap_user_name = uid\n' \
-            'ldap_user_gecos = displayName\n' \
             'ldap_group_member = uniqueMember\n' \
-            'ldap_user_member_of = memberOf\n' \
-            '\n' \
-            '# Group mapping settings\n' \
-            'ldap_group_search_base = %(ldap_base)s\n' \
-            'ldap_user_search_base = %(ldap_base)s\n' \
-            '\n' \
-            '# Simplify and ensure reliability\n' \
             'enumerate = true\n' \
             'cache_credentials = true\n' \
             'use_fully_qualified_names = false\n' \

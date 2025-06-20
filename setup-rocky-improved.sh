@@ -154,19 +154,18 @@ EOF
 # Get machine DN
 machine_dn="cn=$(hostname),cn=computers,$ldap_base"
 
-# Configure SSSD with simpler, reliable group mapping
-echo "Configuring SSSD with group mapping..."
+# Configure SSSD with minimal configuration to ensure it works
+echo "Configuring SSSD with minimal settings..."
 mkdir -p /etc/sssd
 cat > /etc/sssd/sssd.conf << EOF
 [sssd]
 config_file_version = 2
-services = nss, pam, sudo
+services = nss, pam
 domains = $kerberos_realm
 
 [nss]
 filter_users = root,nobody,halt,sync,shutdown,operator
 filter_groups = root
-override_homedir = /home/%u
 
 [pam]
 reconnection_retries = 3
@@ -174,9 +173,6 @@ reconnection_retries = 3
 [domain/$kerberos_realm]
 id_provider = ldap
 auth_provider = ldap
-access_provider = ldap
-
-# LDAP connection settings
 ldap_uri = ldap://$ldap_master:7389
 ldap_search_base = $ldap_base
 ldap_tls_reqcert = never
@@ -184,19 +180,9 @@ ldap_tls_cacert = /etc/univention/ssl/ucsCA/CAcert.pem
 ldap_default_bind_dn = $machine_dn
 ldap_default_authtok_type = password
 ldap_default_authtok = $password
-
-# Basic schema settings
 ldap_schema = rfc2307bis
 ldap_user_name = uid
-ldap_user_gecos = displayName
 ldap_group_member = uniqueMember
-ldap_user_member_of = memberOf
-
-# Group mapping settings
-ldap_group_search_base = $ldap_base
-ldap_user_search_base = $ldap_base
-
-# Simplify and ensure reliability
 enumerate = true
 cache_credentials = true
 use_fully_qualified_names = false
