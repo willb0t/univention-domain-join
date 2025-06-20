@@ -15,7 +15,7 @@ from univention_domain_join.join_steps.ldap_configurator import LdapConfigurator
 from univention_domain_join.join_steps.pam_configurator import PamConfigurator
 from univention_domain_join.join_steps.sssd_configurator import SssdConfigurator
 from univention_domain_join.utils import ldap
-from univention_domain_join.utils.general import execute_as_root, name_is_resolvable
+from univention_domain_join.utils.general import execute_as_root, name_is_resolvable, ssh
 
 userinfo_logger = logging.getLogger('userinfo')
 
@@ -136,17 +136,79 @@ class Joiner(AbstractJoiner):
     
     @execute_as_root
     def _configure_ldap(self, dc_ip: str, ldap_server_name: str, admin_username: str, admin_pw: str, ldap_base: str, admin_dn: str) -> None:
-        """Configure LDAP for Rocky Linux."""
-        userinfo_logger.info('Configuring LDAP for Rocky Linux')
+        """Configure LDAP for Rocky Linux with proper DNS registration."""
+        userinfo_logger.info('Configuring LDAP for Rocky Linux with DNS registration')
         
         # Get the UCS root certificate
         from univention_domain_join.join_steps.root_certificate_provider import RootCertificateProvider
         RootCertificateProvider().provide_ucs_root_certififcate(dc_ip)
         
-        # Create machine account and get password
+        # Create machine account and get password with enhanced DNS registration
         ldap_configurator = LdapConfigurator()
         password = ldap_configurator.random_password()
-        ldap_configurator.modify_old_entry_or_add_machine_to_ldap(password, dc_ip, admin_username, admin_pw, ldap_base, admin_dn)
+        
+        # Get hostname information
+        hostname_short = subprocess.check_output(['hostname', '-s']).strip().decode()
+        hostname_fqdn = subprocess.check_output(['hostname', '-f']).strip().decode()
+        current_ip = subprocess.check_output("hostname -I | awk '{print $1}'", shell=True).strip().decode()
+        
+        userinfo_logger.info(f'Registering {hostname_short} ({current_ip}) in LDAP and DNS')
+        
+        # Create or modify machine account with additional attributes
+        try:
+            # First try the standard approach
+            ldap_configurator.modify_old_entry_or_add_machine_to_ldap(
+                password, dc_ip, admin_username, admin_pw, ldap_base, admin_dn
+            )
+            
+            # Then update DNS entries via remote commands
+            # Get domain zone
+            cmd = "udm dns/forward_zone list | grep 'zone:' | head -1 | awk '{print $2}'"
+            ssh_process = ssh(admin_username, admin_pw, dc_ip, cmd, stdout=subprocess.PIPE)
+            domain_zone = ssh_process.stdout.read().decode().strip()
+            
+            if domain_zone:
+                # Create DNS A record
+                userinfo_logger.info(f'Creating DNS forward record for {hostname_short}.{domain_zone}')
+                dns_cmd = [
+                    'udm', 'dns/host_record', 'create',
+                    '--superordinate', f'zoneName={domain_zone},cn=dns,{ldap_base}',
+                    '--set', f'name={hostname_short}',
+                    '--set', f'ip={current_ip}'
+                ]
+                ssh(admin_username, admin_pw, dc_ip, dns_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                
+                # Create reverse DNS entry if possible
+                cmd = "udm dns/reverse_zone list | grep 'subnet:' | head -1 | awk '{print $2}'"
+                ssh_process = ssh(admin_username, admin_pw, dc_ip, cmd, stdout=subprocess.PIPE)
+                reverse_zone = ssh_process.stdout.read().decode().strip()
+                
+                if reverse_zone:
+                    userinfo_logger.info(f'Creating DNS reverse record for {current_ip}')
+                    last_octet = current_ip.split('.')[-1]
+                    dns_cmd = [
+                        'udm', 'dns/ptr_record', 'create',
+                        '--superordinate', f'zoneName={reverse_zone},cn=dns,{ldap_base}',
+                        '--set', f'address={last_octet}',
+                        '--set', f'ptr_record={hostname_fqdn}.'
+                    ]
+                    ssh(admin_username, admin_pw, dc_ip, dns_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                else:
+                    userinfo_logger.warning('No reverse zone found for creating PTR record')
+            else:
+                userinfo_logger.warning('Could not determine DNS zone for forward record')
+                
+            # Verify LDAP entry was created
+            verify_cmd = f'ldapsearch -x -LLL -b "{ldap_base}" "(uid={hostname_short})" dn'
+            ssh_process = ssh(admin_username, admin_pw, dc_ip, verify_cmd, stdout=subprocess.PIPE)
+            if "dn:" in ssh_process.stdout.read().decode():
+                userinfo_logger.info('Computer account verified in LDAP')
+            else:
+                userinfo_logger.warning('Could not verify computer account in LDAP')
+                
+        except Exception as e:
+            userinfo_logger.critical(f'Error during LDAP/DNS registration: {e}')
+            raise DomainJoinException(f'LDAP/DNS registration failed: {e}')
         
         # Create LDAP config file (different path on Rocky Linux)
         os.makedirs('/etc/openldap', exist_ok=True)
@@ -164,8 +226,8 @@ class Joiner(AbstractJoiner):
     @execute_as_root
     def _setup_sssd_ldap(self, dc_ip: str, ldap_master: str, ldap_server_name: str, admin_username: str,
                          admin_pw: str, ldap_base: str, kerberos_realm: str, admin_dn: str) -> None:
-        """Configure SSSD for LDAP-only authentication with enhanced group mapping."""
-        userinfo_logger.info('Configuring SSSD for LDAP-only authentication with enhanced group mapping')
+        """Configure SSSD for LDAP-only authentication with basic group mapping."""
+        userinfo_logger.info('Configuring SSSD for LDAP-only authentication with group mapping')
         
         # Get machine DN and password
         machine_dn, _ = ldap.get_machines_udm(dc_ip, admin_username, admin_pw, admin_dn)
@@ -176,30 +238,21 @@ class Joiner(AbstractJoiner):
         sssd_conf = \
             '[sssd]\n' \
             'config_file_version = 2\n' \
-            'reconnection_retries = 3\n' \
-            'sbus_timeout = 30\n' \
             'services = nss, pam, sudo\n' \
             'domains = %(kerberos_realm)s\n' \
-            'debug_level = 0\n' \
             '\n' \
             '[nss]\n' \
-            'reconnection_retries = 3\n' \
             'filter_users = root,nobody,halt,sync,shutdown,operator\n' \
             'filter_groups = root\n' \
-            'debug_level = 0\n' \
             'override_homedir = /home/%%u\n' \
-            'override_shell = /bin/bash\n' \
             '\n' \
             '[pam]\n' \
             'reconnection_retries = 3\n' \
-            'debug_level = 0\n' \
             '\n' \
             '[domain/%(kerberos_realm)s]\n' \
-            'debug_level = 0\n' \
             'id_provider = ldap\n' \
             'auth_provider = ldap\n' \
             'access_provider = ldap\n' \
-            'chpass_provider = ldap\n' \
             '\n' \
             '# LDAP connection settings\n' \
             'ldap_uri = ldap://%(ldap_server_name)s:7389\n' \
@@ -210,39 +263,20 @@ class Joiner(AbstractJoiner):
             'ldap_default_authtok_type = password\n' \
             'ldap_default_authtok = %(ldap_password)s\n' \
             '\n' \
-            '# Schema and attribute mapping settings\n' \
+            '# Basic schema settings\n' \
             'ldap_schema = rfc2307bis\n' \
+            'ldap_user_name = uid\n' \
+            'ldap_user_gecos = displayName\n' \
             'ldap_group_member = uniqueMember\n' \
             'ldap_user_member_of = memberOf\n' \
-            'ldap_user_gecos = displayName\n' \
-            'ldap_user_uuid = entryUUID\n' \
-            'ldap_group_uuid = entryUUID\n' \
-            'ldap_user_object_class = posixAccount\n' \
-            'ldap_group_object_class = posixGroup\n' \
             '\n' \
-            '# Group mapping improvements\n' \
+            '# Group mapping settings\n' \
             'ldap_group_search_base = %(ldap_base)s\n' \
             'ldap_user_search_base = %(ldap_base)s\n' \
-            'ldap_group_name = cn\n' \
-            'ldap_user_name = uid\n' \
-            'ldap_account_expire_policy = shadow\n' \
-            'ldap_access_order = filter\n' \
-            'ldap_access_filter = (objectClass=posixAccount)\n' \
             '\n' \
-            '# Group nesting - essential for proper group mapping\n' \
-            'ldap_group_nesting_level = 5\n' \
-            'ldap_nested_groups = true\n' \
-            'ldap_referrals = false\n' \
-            '\n' \
-            '# Performance settings\n' \
+            '# Simplify and ensure reliability\n' \
             'enumerate = true\n' \
             'cache_credentials = true\n' \
-            'entry_cache_timeout = 600\n' \
-            'entry_cache_nowait_percentage = 75\n' \
-            '\n' \
-            '# Create home directories on first login\n' \
-            'fallback_homedir = /home/%%u\n' \
-            'default_shell = /bin/bash\n' \
             'use_fully_qualified_names = false\n' \
             % {
                 'kerberos_realm': kerberos_realm,

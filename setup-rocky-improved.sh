@@ -67,13 +67,70 @@ chmod 660 /etc/univention/ucr_master
 # Generate a strong random password for the machine account
 password="$(tr -dc 'A-Za-z0-9_!@#$%^&*()' </dev/urandom | head -c24)"
 
-# Create computer account on the UCS server
+# Create computer account on the UCS server with proper DNS registration
 echo "Creating computer account on $FQDN_DC UCS server..."
-sshpass -p "$REALMADMINPASS" ssh $ssh_options -n $REALMADMIN@$FQDN_DC udm computers/linux create \
+HOSTNAME_SHORT=$(hostname -s)
+HOSTNAME_FQDN=$(hostname -f)
+CURRENT_IP=$(hostname -I | awk '{print $1}')
+
+# More robust computer creation with DNS entries and verification
+set -e  # Exit on error
+sshpass -p "$REALMADMINPASS" ssh $ssh_options -n $REALMADMIN@$FQDN_DC bash << EOF
+# Create computer account
+udm computers/linux create \
     --position "cn=computers,${ldap_base}" \
-    --set name=$(hostname) --set password="${password}" \
+    --set name=${HOSTNAME_SHORT} \
+    --set password="${password}" \
     --set operatingSystem="Rocky Linux" \
-    --set operatingSystemVersion="$ROCKY_VERSION"
+    --set operatingSystemVersion="$ROCKY_VERSION" \
+    --set description="Rocky Linux $ROCKY_VERSION joined on $(date)" \
+    --set ip="${CURRENT_IP}"
+
+# Verify computer was created
+echo "Verifying computer account creation..."
+udm computers/linux list --filter uid=${HOSTNAME_SHORT}
+
+# Add forward DNS entry
+echo "Creating DNS forward record for ${HOSTNAME_FQDN}..."
+udm dns/forward_zone list | grep "zone:" | head -1
+DOMAIN_ZONE=\$(udm dns/forward_zone list | grep "zone:" | head -1 | awk '{print \$2}')
+if [ -n "\$DOMAIN_ZONE" ]; then
+    udm dns/host_record create \
+        --superordinate "zoneName=\$DOMAIN_ZONE,cn=dns,\$ldap_base" \
+        --set name=${HOSTNAME_SHORT} \
+        --set ip=${CURRENT_IP} \
+        || echo "DNS forward record creation failed, may already exist"
+else
+    echo "WARNING: Could not determine DNS zone for forward record"
+fi
+
+# Add reverse DNS entry
+echo "Creating DNS reverse record..."
+IP_REVERSE=\$(echo ${CURRENT_IP} | awk -F. '{print \$3"."\$2"."$1}')
+udm dns/reverse_zone list | grep "subnet:" | head -1
+if udm dns/reverse_zone list | grep -q "subnet:"; then
+    REVERSE_ZONE=\$(udm dns/reverse_zone list | grep "subnet:" | head -1 | awk '{print \$2}')
+    if [ -n "\$REVERSE_ZONE" ]; then
+        LAST_OCTET=\$(echo ${CURRENT_IP} | awk -F. '{print \$4}')
+        udm dns/ptr_record create \
+            --superordinate "zoneName=\$REVERSE_ZONE,cn=dns,\$ldap_base" \
+            --set address="\$LAST_OCTET" \
+            --set ptr_record=${HOSTNAME_FQDN}. \
+            || echo "DNS reverse record creation failed, may already exist"
+    else
+        echo "WARNING: Could not determine reverse zone for PTR record"
+    fi
+else
+    echo "WARNING: No reverse zone found for creating PTR record"
+fi
+EOF
+set +e
+
+# Verify LDAP entry was created
+echo "Verifying computer account in LDAP..."
+sshpass -p "$REALMADMINPASS" ssh $ssh_options -n $REALMADMIN@$FQDN_DC ldapsearch -x -LLL -b "${ldap_base}" "(uid=${HOSTNAME_SHORT})" dn | grep -q "dn:" && 
+    echo "SUCCESS: Computer account verified in LDAP" ||
+    echo "WARNING: Could not verify computer account in LDAP"
 
 # Save machine account password
 printf '%s' "$password" >/etc/ldap.secret
@@ -97,36 +154,27 @@ EOF
 # Get machine DN
 machine_dn="cn=$(hostname),cn=computers,$ldap_base"
 
-# Configure SSSD with enhanced group mapping
-echo "Configuring SSSD with enhanced group mapping..."
+# Configure SSSD with simpler, reliable group mapping
+echo "Configuring SSSD with group mapping..."
 mkdir -p /etc/sssd
 cat > /etc/sssd/sssd.conf << EOF
 [sssd]
 config_file_version = 2
-reconnection_retries = 3
-sbus_timeout = 30
 services = nss, pam, sudo
 domains = $kerberos_realm
-debug_level = 0
 
 [nss]
-reconnection_retries = 3
 filter_users = root,nobody,halt,sync,shutdown,operator
 filter_groups = root
-debug_level = 0
 override_homedir = /home/%u
-override_shell = /bin/bash
 
 [pam]
 reconnection_retries = 3
-debug_level = 0
 
 [domain/$kerberos_realm]
-debug_level = 0
 id_provider = ldap
 auth_provider = ldap
 access_provider = ldap
-chpass_provider = ldap
 
 # LDAP connection settings
 ldap_uri = ldap://$ldap_master:7389
@@ -137,39 +185,20 @@ ldap_default_bind_dn = $machine_dn
 ldap_default_authtok_type = password
 ldap_default_authtok = $password
 
-# Schema and attribute mapping settings
+# Basic schema settings
 ldap_schema = rfc2307bis
+ldap_user_name = uid
+ldap_user_gecos = displayName
 ldap_group_member = uniqueMember
 ldap_user_member_of = memberOf
-ldap_user_gecos = displayName
-ldap_user_uuid = entryUUID
-ldap_group_uuid = entryUUID
-ldap_user_object_class = posixAccount
-ldap_group_object_class = posixGroup
 
-# Group mapping improvements
+# Group mapping settings
 ldap_group_search_base = $ldap_base
 ldap_user_search_base = $ldap_base
-ldap_group_name = cn
-ldap_user_name = uid
-ldap_account_expire_policy = shadow
-ldap_access_order = filter
-ldap_access_filter = (objectClass=posixAccount)
 
-# Group nesting - essential for proper group mapping
-ldap_group_nesting_level = 5
-ldap_nested_groups = true
-ldap_referrals = false
-
-# Performance settings
+# Simplify and ensure reliability
 enumerate = true
 cache_credentials = true
-entry_cache_timeout = 600
-entry_cache_nowait_percentage = 75
-
-# Create home directories on first login
-fallback_homedir = /home/%u
-default_shell = /bin/bash
 use_fully_qualified_names = false
 EOF
 
@@ -199,6 +228,14 @@ fi
 
 # Add UCS domain to hosts file for faster resolution
 echo "Adding UCS domain to hosts file..."
+# Backup hosts file
+cp /etc/hosts /etc/hosts.bak.$(date +%Y%m%d%H%M%S)
+
+# Remove existing entries for the UCS domain if they exist
+sed -i '/# UCS Domain/d' /etc/hosts
+sed -i "/$ldap_master/d" /etc/hosts
+
+# Add fresh entries
 echo "# UCS Domain" >> /etc/hosts
 echo "$ldap_master_ip $ldap_master" >> /etc/hosts
 
@@ -233,6 +270,18 @@ fi
 
 # Verify the configuration
 echo "Verifying the configuration..."
+
+# 1. Test hostname resolution
+echo "Testing hostname resolution..."
+ping -c 1 $ldap_master && echo "SUCCESS: Can reach UCS master server" || echo "WARNING: Cannot reach UCS master server"
+
+# 2. Test LDAP connectivity
+echo "Testing LDAP connectivity..."
+ldapsearch -x -h $ldap_master -p 7389 -b "$ldap_base" -s base &>/dev/null && 
+    echo "SUCCESS: LDAP connection to UCS server works" || 
+    echo "WARNING: LDAP connection to UCS server failed"
+
+# 3. Test user authentication
 if id -u "$REALMADMIN" &>/dev/null; then
     echo "WARNING: User $REALMADMIN already exists locally. LDAP user may be masked."
 else
@@ -246,9 +295,32 @@ else
         id "$REALMADMIN" || echo "Could not retrieve groups (this may be normal during initial setup)"
     else
         echo "WARNING: User $REALMADMIN not found. This may be normal if the user doesn't exist in LDAP."
-        echo "You can test with a known LDAP user after reboot."
+        
+        # Try a different approach - list some users from LDAP
+        echo "Trying to list some LDAP users..."
+        getent passwd | grep -v "^root\|nobody\|nfsnobody" | head -5
     fi
 fi
+
+# 4. Test our computer account in LDAP
+echo "Testing our computer account in LDAP..."
+HOSTNAME_SHORT=$(hostname -s)
+getent passwd | grep -q "$HOSTNAME_SHORT" && 
+    echo "SUCCESS: Found our computer account in LDAP passwd database" || 
+    echo "WARNING: Could not find our computer account in LDAP passwd database"
+
+# 5. SSSD status check
+echo "Checking SSSD service status..."
+systemctl status sssd --no-pager || echo "SSSD service is not running correctly"
+
+# Add SSSD debug info
+echo ""
+echo "If you encounter SSSD issues, you can enable debug mode with:"
+echo "  1. Edit /etc/sssd/sssd.conf and add: debug_level = 9"
+echo "  2. Restart SSSD: systemctl restart sssd"
+echo "  3. Check logs: tail -f /var/log/sssd/sssd_$kerberos_realm.log"
+echo ""
+echo "Or run the provided debugging script: ./sssd-debug.sh"
 
 # Provide additional debug command info
 echo ""
