@@ -12,7 +12,6 @@ from univention_domain_join.distributions import AbstractJoiner
 from univention_domain_join.join_steps.dns_configurator import DnsConfigurator
 from univention_domain_join.join_steps.kerberos_configurator import KerberosConfigurator
 from univention_domain_join.join_steps.ldap_configurator import LdapConfigurator
-from univention_domain_join.join_steps.login_manager_configurator import LoginManagerConfigurator
 from univention_domain_join.join_steps.pam_configurator import PamConfigurator
 from univention_domain_join.join_steps.sssd_configurator import SssdConfigurator
 from univention_domain_join.utils import ldap
@@ -57,6 +56,7 @@ class Joiner(AbstractJoiner):
         packages = [
             'sssd', 
             'sssd-ldap', 
+            'sssd-tools',
             'openldap-clients', 
             'oddjob', 
             'oddjob-mkhomedir'
@@ -110,15 +110,18 @@ class Joiner(AbstractJoiner):
             admin_dn = LdapConfigurator().get_admin_dn(self.dc_ip, self.admin_username, self.admin_pw, self.ldap_base)
             
             # For Rocky Linux, we want to use LDAP authentication instead of Samba/AD
-            # So we check if it's a Samba DC but we'll configure for LDAP regardless
+            # Check if it's a Samba DC - we log this but configure for LDAP regardless
             is_samba_dc = ldap.is_samba_dc(self.admin_username, self.admin_pw, self.dc_ip, admin_dn)
+            userinfo_logger.info(f'UCS server is a Samba DC: {is_samba_dc}')
             
             # Configure LDAP - note the path difference for Rocky Linux
             self._configure_ldap(self.dc_ip, self.ldap_server_name, self.admin_username, self.admin_pw, self.ldap_base, admin_dn)
             
             # Configure SSSD for LDAP authentication (not Kerberos)
-            self._setup_sssd_ldap(self.dc_ip, self.ldap_master, self.ldap_server_name, self.admin_username, 
-                               self.admin_pw, self.ldap_base, self.kerberos_realm, admin_dn)
+            self._setup_sssd_ldap(
+                self.dc_ip, self.ldap_master, self.ldap_server_name, self.admin_username,
+                self.admin_pw, self.ldap_base, self.kerberos_realm, admin_dn
+            )
             
             # Configure PAM for Rocky Linux
             self._setup_pam_rocky()
@@ -159,10 +162,10 @@ class Joiner(AbstractJoiner):
         ldap_configurator.create_machine_secret_file(password)
     
     @execute_as_root
-    def _setup_sssd_ldap(self, dc_ip: str, ldap_master: str, ldap_server_name: str, admin_username: str, 
-                      admin_pw: str, ldap_base: str, kerberos_realm: str, admin_dn: str) -> None:
-        """Configure SSSD for LDAP-only authentication."""
-        userinfo_logger.info('Configuring SSSD for LDAP-only authentication')
+    def _setup_sssd_ldap(self, dc_ip: str, ldap_master: str, ldap_server_name: str, admin_username: str,
+                         admin_pw: str, ldap_base: str, kerberos_realm: str, admin_dn: str) -> None:
+        """Configure SSSD for LDAP-only authentication with enhanced group mapping."""
+        userinfo_logger.info('Configuring SSSD for LDAP-only authentication with enhanced group mapping')
         
         # Get machine DN and password
         machine_dn, _ = ldap.get_machines_udm(dc_ip, admin_username, admin_pw, admin_dn)
@@ -177,18 +180,28 @@ class Joiner(AbstractJoiner):
             'sbus_timeout = 30\n' \
             'services = nss, pam, sudo\n' \
             'domains = %(kerberos_realm)s\n' \
+            'debug_level = 0\n' \
             '\n' \
             '[nss]\n' \
             'reconnection_retries = 3\n' \
             'filter_users = root,nobody,halt,sync,shutdown,operator\n' \
             'filter_groups = root\n' \
+            'debug_level = 0\n' \
+            'override_homedir = /home/%%u\n' \
+            'override_shell = /bin/bash\n' \
             '\n' \
             '[pam]\n' \
             'reconnection_retries = 3\n' \
+            'debug_level = 0\n' \
             '\n' \
             '[domain/%(kerberos_realm)s]\n' \
+            'debug_level = 0\n' \
             'id_provider = ldap\n' \
             'auth_provider = ldap\n' \
+            'access_provider = ldap\n' \
+            'chpass_provider = ldap\n' \
+            '\n' \
+            '# LDAP connection settings\n' \
             'ldap_uri = ldap://%(ldap_server_name)s:7389\n' \
             'ldap_search_base = %(ldap_base)s\n' \
             'ldap_tls_reqcert = never\n' \
@@ -196,13 +209,41 @@ class Joiner(AbstractJoiner):
             'ldap_default_bind_dn = %(machines_ldap_dn)s\n' \
             'ldap_default_authtok_type = password\n' \
             'ldap_default_authtok = %(ldap_password)s\n' \
+            '\n' \
+            '# Schema and attribute mapping settings\n' \
             'ldap_schema = rfc2307bis\n' \
+            'ldap_group_member = uniqueMember\n' \
             'ldap_user_member_of = memberOf\n' \
             'ldap_user_gecos = displayName\n' \
             'ldap_user_uuid = entryUUID\n' \
             'ldap_group_uuid = entryUUID\n' \
-            'cache_credentials = true\n' \
+            'ldap_user_object_class = posixAccount\n' \
+            'ldap_group_object_class = posixGroup\n' \
+            '\n' \
+            '# Group mapping improvements\n' \
+            'ldap_group_search_base = %(ldap_base)s\n' \
+            'ldap_user_search_base = %(ldap_base)s\n' \
+            'ldap_group_name = cn\n' \
+            'ldap_user_name = uid\n' \
+            'ldap_account_expire_policy = shadow\n' \
+            'ldap_access_order = filter\n' \
+            'ldap_access_filter = (objectClass=posixAccount)\n' \
+            '\n' \
+            '# Group nesting - essential for proper group mapping\n' \
+            'ldap_group_nesting_level = 5\n' \
+            'ldap_nested_groups = true\n' \
+            'ldap_referrals = false\n' \
+            '\n' \
+            '# Performance settings\n' \
             'enumerate = true\n' \
+            'cache_credentials = true\n' \
+            'entry_cache_timeout = 600\n' \
+            'entry_cache_nowait_percentage = 75\n' \
+            '\n' \
+            '# Create home directories on first login\n' \
+            'fallback_homedir = /home/%%u\n' \
+            'default_shell = /bin/bash\n' \
+            'use_fully_qualified_names = false\n' \
             % {
                 'kerberos_realm': kerberos_realm,
                 'ldap_base': ldap_base,
