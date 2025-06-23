@@ -38,31 +38,86 @@ chmod 660 /etc/univention/ucr_master
 
 . /etc/univention/ucr_master
 
-# Create an account and save the password
-echo "Creating computer account on "$REALMDC.$REALMAD" UCS server. Password for domain admin will be prompted."
+# Check if computer account already exists
+echo "Checking if computer account already exists on "$REALMDC.$REALMAD" UCS server..."
+hostname_short=$(hostname -s)
+computer_exists=$(ssh -n root@$REALMDC.$REALMAD "udm computers/linux list --filter cn=$hostname_short | grep -c DN:")
+computer_exists_with_dollar=$(ssh -n root@$REALMDC.$REALMAD "udm computers/linux list --filter cn=${hostname_short}\$ | grep -c DN:")
+
+# Generate a random password
 password="$(tr -dc A-Za-z0-9_ </dev/urandom | head -c20)"
-ssh -n root@$REALMDC.$REALMAD udm computers/linux create \
-    --position "cn=computers,${ldap_base}" \
-    --set name=$(hostname) --set password="${password}" \
-    --set operatingSystem="Rocky Linux" \
-    --set operatingSystemVersion="$(cat /etc/rocky-release | grep -oP '[\d\.]+' | head -1)" \
-    --set objectFlag="posix" \
-    --set sambaRID="$(( 1000 + $RANDOM % 9000 ))"
+
+if [ "$computer_exists" -gt 0 ] || [ "$computer_exists_with_dollar" -gt 0 ]; then
+    echo "Computer account already exists. Updating password..."
+    
+    # Determine the correct DN to use
+    if [ "$computer_exists" -gt 0 ]; then
+        computer_dn=$(ssh -n root@$REALMDC.$REALMAD "udm computers/linux list --filter cn=$hostname_short | grep DN: | cut -d' ' -f2-")
+    else
+        computer_dn=$(ssh -n root@$REALMDC.$REALMAD "udm computers/linux list --filter cn=${hostname_short}\$ | grep DN: | cut -d' ' -f2-")
+    fi
+    
+    # Update the existing computer account
+    ssh -n root@$REALMDC.$REALMAD udm computers/linux modify \
+        --dn "$computer_dn" \
+        --set password="${password}" \
+        --set operatingSystem="Rocky Linux" \
+        --set operatingSystemVersion="$(cat /etc/rocky-release | grep -oP '[\d\.]+' | head -1)"
+else
+    # Create a new computer account
+    echo "Creating new computer account on "$REALMDC.$REALMAD" UCS server..."
+    ssh -n root@$REALMDC.$REALMAD udm computers/linux create \
+        --position "cn=computers,${ldap_base}" \
+        --set name="$hostname_short" \
+        --set password="${password}" \
+        --set operatingSystem="Rocky Linux" \
+        --set operatingSystemVersion="$(cat /etc/rocky-release | grep -oP '[\d\.]+' | head -1)"
+fi
+
+# Save the password
 printf '%s' "$password" >/etc/ldap.secret
 chmod 0400 /etc/ldap.secret
 
-# Get default domain groups
+# Get domain groups - try different filters to find appropriate groups
 echo "Retrieving domain groups from UCS server..."
+# First try Domain* groups
 domain_groups=$(ssh -n root@$REALMDC.$REALMAD "udm groups/group list --filter cn=Domain* | grep DN: | cut -d' ' -f2-")
 
+# If no Domain* groups found, try groups with "domain" in their name (case insensitive)
+if [ -z "$domain_groups" ]; then
+    echo "No Domain* groups found, trying alternative group search..."
+    domain_groups=$(ssh -n root@$REALMDC.$REALMAD "udm groups/group list | grep -i domain | grep DN: | cut -d' ' -f2-")
+fi
+
+# If still no groups found, try to get all groups
+if [ -z "$domain_groups" ]; then
+    echo "No domain groups found, listing all available groups..."
+    domain_groups=$(ssh -n root@$REALMDC.$REALMAD "udm groups/group list --filter objectClass=univentionGroup | grep DN: | cut -d' ' -f2-")
+fi
+
 # Add computer to domain groups
-echo "Adding computer to domain groups..."
-for group_dn in $domain_groups; do
-    echo "Adding $(hostname) to group: $group_dn"
-    ssh -n root@$REALMDC.$REALMAD udm groups/group modify \
-        --dn "$group_dn" \
-        --append hosts="cn=$(hostname),cn=computers,${ldap_base}"
-done
+if [ -n "$domain_groups" ]; then
+    echo "Adding computer to domain groups..."
+    # Use the short hostname for consistency
+    computer_cn="cn=${hostname_short},cn=computers,${ldap_base}"
+    
+    # Process each group DN
+    echo "$domain_groups" | while read -r group_dn; do
+        if [ -n "$group_dn" ]; then
+            echo "Adding ${hostname_short} to group: $group_dn"
+            # Add error handling for the group modification
+            if ! ssh -n root@$REALMDC.$REALMAD udm groups/group modify \
+                --dn "$group_dn" \
+                --append hosts="$computer_cn"; then
+                echo "Warning: Failed to add computer to group: $group_dn"
+                echo "This is non-fatal, continuing with domain join..."
+            fi
+        fi
+    done
+else
+    echo "Warning: No groups found to add the computer to."
+    echo "This is non-fatal, continuing with domain join..."
+fi
 
 # Get UCS CA certificate
 echo "Retrieving UCS CA certificate..."
@@ -76,9 +131,9 @@ echo "TLS_CACERT /etc/univention/ssl/ucsCA/CAcert.pem
 URI ldap://$ldap_master:7389
 BASE $ldap_base" > /etc/openldap/ldap.conf
 
-# Get machine DN
+# Get machine DN - use short hostname for consistency
 echo "Getting machine DN..."
-machine_dn="cn=$(hostname),cn=computers,$ldap_base"
+machine_dn="cn=${hostname_short},cn=computers,$ldap_base"
 
 # Configure SSSD for LDAP authentication
 echo "Configuring SSSD for LDAP authentication..."

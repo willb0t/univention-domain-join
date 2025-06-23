@@ -51,15 +51,33 @@ def get_machines_udm(dc_ip: str, admin_username: str, admin_pw: str, admin_dn: s
 
 
 def get_machines_ldap_dn_given_the_udm_type(udm_type: str, dc_ip: str, admin_username: str, admin_pw: str, admin_dn: str) -> str:
-    hostname = gethostname()
+    # Get short hostname for consistency
+    hostname = gethostname().split('.')[0]
+    
+    # First try with the exact hostname
+    log.debug("Searching for computer account with name=%s", hostname)
     cmd = ['/usr/sbin/udm', udm_type, 'list', '--binddn', admin_dn, '--bindpwdfile', PW(admin_username), '--filter', 'name=%s' % (hostname,)]
     ssh_process = ssh(admin_username, admin_pw, dc_ip, cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     assert ssh_process.stdout
+    
     for line in ssh_process.stdout:
         key, _, val = line.decode().partition(': ')
         if key == "DN":
             return val.strip()
+    
+    # If not found, try with hostname$
+    log.debug("Computer account not found with name=%s, trying with name=%s$", hostname, hostname)
+    cmd = ['/usr/sbin/udm', udm_type, 'list', '--binddn', admin_dn, '--bindpwdfile', PW(admin_username), '--filter', 'name=%s$' % (hostname,)]
+    ssh_process = ssh(admin_username, admin_pw, dc_ip, cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert ssh_process.stdout
+    
+    for line in ssh_process.stdout:
+        key, _, val = line.decode().partition(': ')
+        if key == "DN":
+            return val.strip()
+    
     _, stderr = ssh_process.communicate()
     if ssh_process.returncode or stderr:
         log.debug("%r returned %d: %s", cmd, ssh_process.returncode, stderr.decode())
+    
     raise LookupError(hostname)

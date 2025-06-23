@@ -184,34 +184,67 @@ class Joiner(AbstractJoiner):
         userinfo_logger.info('Adding machine account to domain groups')
         
         try:
-            # Get domain groups
+            # Get domain groups using different strategies
             import subprocess
-            import re
+            import socket
             
-            # Query domain groups using UDM
+            # Use short hostname for consistency
+            hostname_short = socket.gethostname().split('.')[0]
+            machine_dn = f"cn={hostname_short},cn=computers,{ldap_base}"
+            
+            # First try Domain* groups
+            userinfo_logger.info('Searching for Domain* groups...')
             cmd = [
                 'ssh', '-n', f'root@{dc_ip}',
                 f'udm groups/group list --filter cn=Domain* | grep DN: | cut -d" " -f2-'
             ]
             
             result = subprocess.check_output(cmd, universal_newlines=True)
-            domain_groups = result.strip().split('\n')
+            domain_groups = result.strip().split('\n') if result.strip() else []
             
-            # Add machine to each domain group
-            machine_dn = f"cn={hostname},cn=computers,{ldap_base}"
-            for group_dn in domain_groups:
-                if not group_dn:
-                    continue
-                    
-                userinfo_logger.info(f'Adding {hostname} to group: {group_dn}')
-                
-                # Use UDM to add machine to group
-                add_cmd = [
+            # If no Domain* groups found, try groups with "domain" in their name (case insensitive)
+            if not domain_groups:
+                userinfo_logger.info('No Domain* groups found, trying alternative group search...')
+                cmd = [
                     'ssh', '-n', f'root@{dc_ip}',
-                    f'udm groups/group modify --dn "{group_dn}" --append hosts="{machine_dn}"'
+                    f'udm groups/group list | grep -i domain | grep DN: | cut -d" " -f2-'
                 ]
                 
-                subprocess.check_call(add_cmd)
+                result = subprocess.check_output(cmd, universal_newlines=True)
+                domain_groups = result.strip().split('\n') if result.strip() else []
+            
+            # If still no groups found, try to get all groups
+            if not domain_groups:
+                userinfo_logger.info('No domain groups found, listing all available groups...')
+                cmd = [
+                    'ssh', '-n', f'root@{dc_ip}',
+                    f'udm groups/group list --filter objectClass=univentionGroup | grep DN: | cut -d" " -f2-'
+                ]
+                
+                result = subprocess.check_output(cmd, universal_newlines=True)
+                domain_groups = result.strip().split('\n') if result.strip() else []
+            
+            # Add machine to each domain group
+            if domain_groups:
+                for group_dn in domain_groups:
+                    if not group_dn:
+                        continue
+                        
+                    userinfo_logger.info(f'Adding {hostname_short} to group: {group_dn}')
+                    
+                    try:
+                        # Use UDM to add machine to group
+                        add_cmd = [
+                            'ssh', '-n', f'root@{dc_ip}',
+                            f'udm groups/group modify --dn "{group_dn}" --append hosts="{machine_dn}"'
+                        ]
+                        
+                        subprocess.check_call(add_cmd)
+                    except subprocess.CalledProcessError as e:
+                        userinfo_logger.warning(f'Failed to add computer to group {group_dn}: {e}')
+                        # Continue with the next group
+            else:
+                userinfo_logger.warning('No groups found to add the computer to.')
                 
         except subprocess.CalledProcessError as e:
             userinfo_logger.warning(f'Failed to add machine to domain groups: {e}')
@@ -223,8 +256,12 @@ class Joiner(AbstractJoiner):
         """Configure SSSD for LDAP-only authentication."""
         userinfo_logger.info('Configuring SSSD for LDAP-only authentication')
         
-        # Get machine DN and password
-        machine_dn, _ = ldap.get_machines_udm(dc_ip, admin_username, admin_pw, admin_dn)
+        # Use short hostname for consistency
+        import socket
+        hostname_short = socket.gethostname().split('.')[0]
+        machine_dn = f"cn={hostname_short},cn=computers,{ldap_base}"
+        
+        # Get machine password
         ldap_password = open('/etc/machine.secret').read().strip()
         
         # Create SSSD config with LDAP as both id_provider and auth_provider

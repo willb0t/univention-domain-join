@@ -37,8 +37,9 @@ echo "Detected domain: $DOMAIN"
 echo "Backing up current SSSD configuration..."
 cp /etc/sssd/sssd.conf /etc/sssd/sssd.conf.bak.$(date +%Y%m%d%H%M%S)
 
-# Get machine DN
-machine_dn="cn=$(hostname),cn=computers,$ldap_base"
+# Get machine DN - use short hostname for consistency
+hostname_short=$(hostname -s)
+machine_dn="cn=${hostname_short},cn=computers,$ldap_base"
 echo "Machine DN: $machine_dn"
 
 # Get machine password
@@ -152,8 +153,9 @@ cat > /usr/local/bin/sync-ucs-groups.sh << 'EOF'
 # Source UCR variables
 . /etc/univention/ucr_master
 
-# Get the machine DN
-machine_dn="cn=$(hostname),cn=computers,$ldap_base"
+# Get the machine DN - use short hostname for consistency
+hostname_short=$(hostname -s)
+machine_dn="cn=${hostname_short},cn=computers,$ldap_base"
 
 # Get the machine password
 ldap_password=$(cat /etc/ldap.secret)
