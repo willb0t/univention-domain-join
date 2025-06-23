@@ -143,7 +143,24 @@ class Joiner(AbstractJoiner):
         # Create machine account and get password
         ldap_configurator = LdapConfigurator()
         password = ldap_configurator.random_password()
-        ldap_configurator.modify_old_entry_or_add_machine_to_ldap(password, dc_ip, admin_username, admin_pw, ldap_base, admin_dn)
+        
+        # Set additional machine account attributes for better group mapping
+        import socket
+        hostname = socket.gethostname()
+        
+        # Add posix and samba attributes to the machine account
+        ldap_configurator.modify_old_entry_or_add_machine_to_ldap(
+            password, 
+            dc_ip, 
+            admin_username, 
+            admin_pw, 
+            ldap_base, 
+            admin_dn,
+            additional_attributes={
+                'objectFlag': 'posix',
+                'sambaRID': str(1000 + os.getpid() % 9000)  # Generate a random RID
+            }
+        )
         
         # Create LDAP config file (different path on Rocky Linux)
         os.makedirs('/etc/openldap', exist_ok=True)
@@ -157,6 +174,48 @@ class Joiner(AbstractJoiner):
             
         # Create machine secret file
         ldap_configurator.create_machine_secret_file(password)
+        
+        # Add machine to domain groups
+        self._add_machine_to_domain_groups(dc_ip, admin_username, admin_pw, ldap_base, hostname)
+    
+    @execute_as_root
+    def _add_machine_to_domain_groups(self, dc_ip: str, admin_username: str, admin_pw: str, ldap_base: str, hostname: str) -> None:
+        """Add the machine account to domain groups."""
+        userinfo_logger.info('Adding machine account to domain groups')
+        
+        try:
+            # Get domain groups
+            import subprocess
+            import re
+            
+            # Query domain groups using UDM
+            cmd = [
+                'ssh', '-n', f'root@{dc_ip}',
+                f'udm groups/group list --filter cn=Domain* | grep DN: | cut -d" " -f2-'
+            ]
+            
+            result = subprocess.check_output(cmd, universal_newlines=True)
+            domain_groups = result.strip().split('\n')
+            
+            # Add machine to each domain group
+            machine_dn = f"cn={hostname},cn=computers,{ldap_base}"
+            for group_dn in domain_groups:
+                if not group_dn:
+                    continue
+                    
+                userinfo_logger.info(f'Adding {hostname} to group: {group_dn}')
+                
+                # Use UDM to add machine to group
+                add_cmd = [
+                    'ssh', '-n', f'root@{dc_ip}',
+                    f'udm groups/group modify --dn "{group_dn}" --append hosts="{machine_dn}"'
+                ]
+                
+                subprocess.check_call(add_cmd)
+                
+        except subprocess.CalledProcessError as e:
+            userinfo_logger.warning(f'Failed to add machine to domain groups: {e}')
+            # Continue with the join process even if group membership fails
     
     @execute_as_root
     def _setup_sssd_ldap(self, dc_ip: str, ldap_master: str, ldap_server_name: str, admin_username: str, 
@@ -215,6 +274,17 @@ class Joiner(AbstractJoiner):
             'ldap_group_gid_number = gidNumber\n' \
             'ldap_group_member = uniqueMember\n' \
             'ldap_group_uuid = entryUUID\n' \
+            'ldap_group_search_base = %(ldap_base)s\n' \
+            'ldap_group_search_filter = (|(objectClass=posixGroup)(objectClass=univentionGroup)(objectClass=sambaGroupMapping))\n' \
+            '\n' \
+            '# Enhanced group mapping\n' \
+            'ldap_group_nesting_level = 5\n' \
+            'ldap_initgroups_use_matching_rule_in_chain = True\n' \
+            'ldap_user_principal = uid\n' \
+            'ldap_group_member_of_user_attr = dn\n' \
+            '\n' \
+            '# Machine account group membership\n' \
+            'ldap_use_tokengroups = False\n' \
             '\n' \
             '# ID mapping\n' \
             'ldap_id_mapping = False\n' \

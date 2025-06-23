@@ -45,9 +45,24 @@ ssh -n root@$REALMDC.$REALMAD udm computers/linux create \
     --position "cn=computers,${ldap_base}" \
     --set name=$(hostname) --set password="${password}" \
     --set operatingSystem="Rocky Linux" \
-    --set operatingSystemVersion="$(cat /etc/rocky-release | grep -oP '[\d\.]+' | head -1)"
+    --set operatingSystemVersion="$(cat /etc/rocky-release | grep -oP '[\d\.]+' | head -1)" \
+    --set objectFlag="posix" \
+    --set sambaRID="$(( 1000 + $RANDOM % 9000 ))"
 printf '%s' "$password" >/etc/ldap.secret
 chmod 0400 /etc/ldap.secret
+
+# Get default domain groups
+echo "Retrieving domain groups from UCS server..."
+domain_groups=$(ssh -n root@$REALMDC.$REALMAD "udm groups/group list --filter cn=Domain* | grep DN: | cut -d' ' -f2-")
+
+# Add computer to domain groups
+echo "Adding computer to domain groups..."
+for group_dn in $domain_groups; do
+    echo "Adding $(hostname) to group: $group_dn"
+    ssh -n root@$REALMDC.$REALMAD udm groups/group modify \
+        --dn "$group_dn" \
+        --append hosts="cn=$(hostname),cn=computers,${ldap_base}"
+done
 
 # Get UCS CA certificate
 echo "Retrieving UCS CA certificate..."
@@ -113,6 +128,17 @@ ldap_group_name = cn
 ldap_group_gid_number = gidNumber
 ldap_group_member = uniqueMember
 ldap_group_uuid = entryUUID
+ldap_group_search_base = $ldap_base
+ldap_group_search_filter = (|(objectClass=posixGroup)(objectClass=univentionGroup)(objectClass=sambaGroupMapping))
+
+# Enhanced group mapping
+ldap_group_nesting_level = 5
+ldap_initgroups_use_matching_rule_in_chain = True
+ldap_user_principal = uid
+ldap_group_member_of_user_attr = dn
+
+# Machine account group membership
+ldap_use_tokengroups = False
 
 # ID mapping
 ldap_id_mapping = False

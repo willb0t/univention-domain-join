@@ -46,19 +46,19 @@ class LdapConfigurator(ConflictChecker):
         self.create_ldap_conf_file(ldap_server_name, ldap_base)
         self.create_machine_secret_file(password)
 
-    def modify_old_entry_or_add_machine_to_ldap(self, password: str, dc_ip: str, admin_username: str, admin_pw: str, ldap_base: str, admin_dn: str) -> str:
+    def modify_old_entry_or_add_machine_to_ldap(self, password: str, dc_ip: str, admin_username: str, admin_pw: str, ldap_base: str, admin_dn: str, additional_attributes: dict = None) -> str:
         try:
             udm_type, dn = get_machines_udm(dc_ip, admin_username, admin_pw, admin_dn)
             log.info("Found existing LDAP entry %r of type %r", dn, udm_type)
         except LookupError:
-            dn = self.add_machine_to_ldap(password, dc_ip, admin_username, admin_pw, ldap_base, admin_dn)
+            dn = self.add_machine_to_ldap(password, dc_ip, admin_username, admin_pw, ldap_base, admin_dn, additional_attributes)
             log.info("Created LDAP entry %r", dn)
         else:
-            self.modify_machine_in_ldap(password, dc_ip, admin_username, admin_pw, admin_dn, udm_type, dn)
+            self.modify_machine_in_ldap(password, dc_ip, admin_username, admin_pw, admin_dn, udm_type, dn, additional_attributes)
             log.info("Modified LDAP entry %r", dn)
         return dn
 
-    def modify_machine_in_ldap(self, password: str, dc_ip: str, admin_username: str, admin_pw: str, admin_dn: str, udm_type: str, dn: str) -> None:
+    def modify_machine_in_ldap(self, password: str, dc_ip: str, admin_username: str, admin_pw: str, admin_dn: str, udm_type: str, dn: str, additional_attributes: dict = None) -> None:
         userinfo_logger.info('Updating old LDAP entry for this machine on the UCS DC')
 
         release_id = get_distribution()
@@ -75,6 +75,11 @@ class LdapConfigurator(ConflictChecker):
             '--set', 'operatingSystem=%s' % (release_id,),
             '--set', 'operatingSystemVersion=%s' % (release,)
         ]
+        
+        # Add additional attributes if provided
+        if additional_attributes:
+            for key, value in additional_attributes.items():
+                cmd.extend(['--set', f'{key}={value}'])
         ssh_process = ssh(admin_username, admin_pw, dc_ip, cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         _, stderr = ssh_process.communicate()
         if ssh_process.returncode != 0:
@@ -82,14 +87,18 @@ class LdapConfigurator(ConflictChecker):
             log.critical("%r returned %d: %s", cmd, ssh_process.returncode, stderr.decode())
             raise LdapConfigutationException()
 
-    def add_machine_to_ldap(self, password: str, dc_ip: str, admin_username: str, admin_pw: str, ldap_base: str, admin_dn: str) -> str:
+    def add_machine_to_ldap(self, password: str, dc_ip: str, admin_username: str, admin_pw: str, ldap_base: str, admin_dn: str, additional_attributes: dict = None) -> str:
         userinfo_logger.info('Adding LDAP entry for this machine on the UCS DC')
         hostname = subprocess.check_output(['hostname', '-s']).strip().decode()
         release_id = get_distribution()
         release = get_release()
+        
+        # Determine the computer object type based on the distribution
+        computer_type = 'computers/linux' if release_id.lower() in ['rocky', 'centos', 'rhel'] else 'computers/ubuntu'
+        
         # TODO: Also add MAC address. Which NIC's address should be used?
         udm_command = [
-            '/usr/sbin/udm', 'computers/ubuntu', 'create',
+            '/usr/sbin/udm', computer_type, 'create',
             '--binddn', admin_dn,
             '--bindpwdfile', PW(admin_username),
             '--position', 'cn=computers,%s' % (ldap_base,),
@@ -98,6 +107,11 @@ class LdapConfigurator(ConflictChecker):
             '--set', 'operatingSystem=%s' % (release_id,),
             '--set', 'operatingSystemVersion=%s' % (release,)
         ]
+        
+        # Add additional attributes if provided
+        if additional_attributes:
+            for key, value in additional_attributes.items():
+                udm_command.extend(['--set', f'{key}={value}'])
         ssh_process = ssh(admin_username, admin_pw, dc_ip, udm_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         stdout, stderr = ssh_process.communicate()
         if ssh_process.returncode != 0 or stderr.decode().startswith('E: '):

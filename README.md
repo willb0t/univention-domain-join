@@ -75,9 +75,37 @@ sudo ./setup-rocky.sh
 This script will:
 1. Install the necessary packages
 2. Configure LDAP authentication
-3. Set up SSSD for user authentication
-4. Configure PAM for home directory creation
-5. Handle SELinux settings
+3. Set up SSSD for user authentication with enhanced group mapping
+4. Add the machine account to domain groups
+5. Configure PAM for home directory creation
+6. Handle SELinux settings
+
+### Enhanced Group Mapping for Rocky Linux
+
+The Rocky Linux implementation includes enhanced group mapping functionality that ensures both user and machine groups are properly mapped from the UCS domain to the local system. This includes:
+
+- Support for nested groups with configurable nesting level
+- Proper mapping of all group attributes
+- Machine account group membership
+- Support for RFC2307bis schema
+
+If you've already joined a Rocky Linux system to the domain and want to enhance the group mapping, you can use the provided `update-group-mapping.sh` script:
+
+```shell
+sudo ./update-group-mapping.sh
+```
+
+This script will:
+1. Update the SSSD configuration with enhanced group mapping options
+2. Create a group membership synchronization script
+3. Set up a cron job to periodically synchronize group memberships
+4. Restart SSSD to apply the changes
+
+You can verify the group mapping is working correctly by running:
+```shell
+id username  # Check user group memberships
+getent group groupname  # Check group members
+```
 
 # Doc
 

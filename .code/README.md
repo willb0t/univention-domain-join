@@ -95,9 +95,49 @@ The implementation has been tested on:
 - Rocky Linux 8
 - Rocky Linux 9
 
+## Enhanced Group Mapping
+
+The implementation now includes enhanced group mapping functionality that ensures both user and machine groups are properly mapped from the UCS domain to the local system:
+
+1. **Enhanced Group Mapping Configuration**:
+   ```
+   # Enhanced group mapping
+   ldap_group_nesting_level = 5
+   ldap_initgroups_use_matching_rule_in_chain = True
+   ldap_user_principal = uid
+   ldap_group_member_of_user_attr = dn
+   
+   # Machine account group membership
+   ldap_use_tokengroups = False
+   ```
+
+2. **Group Search Filters**:
+   ```
+   ldap_group_search_base = $ldap_base
+   ldap_group_search_filter = (|(objectClass=posixGroup)(objectClass=univentionGroup)(objectClass=sambaGroupMapping))
+   ```
+
+3. **Machine Account Group Membership**:
+   - Adds the `objectFlag=posix` attribute to machine accounts
+   - Automatically adds machine accounts to domain groups
+   - Configures SSSD to properly handle machine group memberships
+
+4. **Group Membership Synchronization**:
+   - The `update-group-mapping.sh` script updates SSSD configuration with enhanced group mapping
+   - Creates a synchronization script that runs periodically via cron
+   - Ensures both user and machine groups are properly synchronized
+
+### Testing Group Mapping
+
+You can verify the group mapping is working correctly by running:
+```shell
+id username  # Check user group memberships
+getent group groupname  # Check group members
+```
+
 ## Future Improvements
 
 Potential future improvements include:
 - Support for more RHEL-based distributions (CentOS, Alma Linux, etc.)
-- Enhanced group membership handling
 - Support for more complex LDAP schemas
+- Integration with Samba/AD authentication as an alternative to LDAP
