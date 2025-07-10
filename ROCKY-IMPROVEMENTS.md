@@ -41,10 +41,17 @@ A more thorough backup system:
 
 SSSD configuration has been improved:
 
-- Support for RFC2307bis schema
-- Proper attribute mappings for users and groups
+- Support for RFC2307bis schema with proper LDAP group attributes
+- Comprehensive attribute mappings for users and groups including:
+  - `ldap_group_member = uniqueMember` (UCS uses uniqueMember)
+  - `ldap_group_object_class = univentionGroup` (UCS group object class)
+  - `ldap_group_name = cn` (group name attribute)
+  - `ldap_group_gid_number = gidNumber` (group ID attribute)
+  - `ldap_group_nesting_level = 2` (support for nested groups)
+  - `ldap_id_mapping = False` (use POSIX IDs from LDAP)
 - Group mapping support via conf.d directory
 - Domain Admins to wheel group mapping for administrative access
+- Enhanced group resolution and membership handling
 
 ### 5. Improved SELinux Configuration
 
@@ -146,6 +153,31 @@ Common issues and solutions:
 - **Authentication Failures**: Ensure the domain admin credentials are correct.
 
 ## Technical Details
+
+### OpenLDAP Group Mapping Fixes
+
+The Rocky Linux implementation now includes comprehensive OpenLDAP group mapping fixes:
+
+#### Group Attribute Configuration
+- **ldap_group_member**: Set to `uniqueMember` to match UCS LDAP schema
+- **ldap_group_object_class**: Set to `univentionGroup` for proper UCS group recognition
+- **ldap_group_name**: Set to `cn` for group name resolution
+- **ldap_group_gid_number**: Set to `gidNumber` for proper GID mapping
+- **ldap_group_nesting_level**: Set to `2` to support nested group memberships
+- **ldap_id_mapping**: Set to `False` to use POSIX IDs directly from LDAP
+
+#### Administrative Group Mapping
+- Domain Admins group is automatically mapped to the local `wheel` group
+- Members of Domain Admins gain sudo privileges through wheel group membership
+- Sudoers configuration ensures wheel group has administrative access
+- Group mapping is configured via `/etc/sssd/conf.d/group_mapping.conf`
+
+#### Verification and Testing
+- LDAP connection testing during domain join
+- SSSD domain status verification
+- Group lookup testing for Domain Admins
+- Configuration file existence verification
+- Comprehensive logging of all verification steps
 
 ### LDAP Configuration
 

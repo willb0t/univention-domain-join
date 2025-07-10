@@ -19,7 +19,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 echo "Installing necessary packages..."
-dnf -y install sssd sssd-ldap openldap-clients oddjob oddjob-mkhomedir
+dnf -y install sssd sssd-ldap openldap-clients oddjob oddjob-mkhomedir nfs-utils autofs
 
 clear
 echo "Completed installation of necessary packages."
@@ -65,6 +65,10 @@ BASE $ldap_base" > /etc/openldap/ldap.conf
 echo "Getting machine DN..."
 machine_dn="cn=$(hostname),cn=computers,$ldap_base"
 
+# Configure SSSD to use /nfs/home for home directories
+echo "Configuring SSSD to use /nfs/home for home directories..."
+mkdir -p /nfs/home
+
 # Configure SSSD for LDAP authentication
 echo "Configuring SSSD for LDAP authentication..."
 mkdir -p /etc/sssd
@@ -101,9 +105,24 @@ ldap_user_uuid = entryUUID
 ldap_group_uuid = entryUUID
 cache_credentials = true
 enumerate = true
+override_homedir = /nfs/home/%u
 EOF
 
 chmod 600 /etc/sssd/sssd.conf
+
+# Configure autofs for NFS home directories
+echo "Configuring autofs for NFS home directories..."
+cat > /etc/auto.master.d/home.autofs << EOF
+/nfs/home /etc/auto.home --timeout=60
+EOF
+
+cat > /etc/auto.home << EOF
+* $REALMDC.$REALMAD:/home/&
+EOF
+
+# Ensure autofs is enabled and started
+systemctl enable autofs
+systemctl restart autofs
 
 # Configure PAM for home directory creation
 echo "Configuring PAM for home directory creation..."
@@ -120,9 +139,9 @@ systemctl restart sssd
 # Enable SSSD to start at boot
 systemctl enable sssd
 
-echo "UCS LDAP Domain Join Complete!"
+echo "Domain join completed successfully with home directories mapped to /nfs/home"
+echo "Note: Ensure that the NFS server on $REALMDC.$REALMAD is properly configured to export /home"
 echo "You can now authenticate with domain users."
-echo "Note: You may need to reboot for all changes to take effect."
 
 # Prompt for reboot
 read -r -p "REBOOT NOW? [y/N] " rebootnow

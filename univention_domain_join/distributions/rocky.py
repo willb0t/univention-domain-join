@@ -82,6 +82,16 @@ class Joiner(AbstractJoiner):
         if os.path.exists('/etc/openldap/ldap.conf'):
             os.makedirs(os.path.join(backup_dir, 'etc/openldap'), exist_ok=True)
             os.system(f'cp /etc/openldap/ldap.conf {backup_dir}/etc/openldap/')
+        
+        # Back up SSSD conf.d directory for group mappings
+        if os.path.exists('/etc/sssd/conf.d'):
+            os.makedirs(os.path.join(backup_dir, 'etc/sssd/conf.d'), exist_ok=True)
+            os.system(f'cp -r /etc/sssd/conf.d/* {backup_dir}/etc/sssd/conf.d/ 2>/dev/null || true')
+        
+        # Back up sudoers.d files
+        if os.path.exists('/etc/sudoers.d'):
+            os.makedirs(os.path.join(backup_dir, 'etc/sudoers.d'), exist_ok=True)
+            os.system(f'cp /etc/sudoers.d/* {backup_dir}/etc/sudoers.d/ 2>/dev/null || true')
             
         SssdConfigurator().backup(backup_dir)
         PamConfigurator().backup(backup_dir)
@@ -120,11 +130,17 @@ class Joiner(AbstractJoiner):
             self._setup_sssd_ldap(self.dc_ip, self.ldap_master, self.ldap_server_name, self.admin_username, 
                                self.admin_pw, self.ldap_base, self.kerberos_realm, admin_dn)
             
+            # Configure group mapping for administrative access
+            self._setup_group_mapping(self.ldap_base, self.kerberos_realm)
+            
             # Configure PAM for Rocky Linux
             self._setup_pam_rocky()
             
             # Configure SELinux to allow LDAP authentication
             self._configure_selinux()
+            
+            # Verify group mapping configuration
+            self._verify_group_mapping()
             
             userinfo_logger.info('The domain join was successful.')
             userinfo_logger.info('Please reboot the system.')
@@ -201,6 +217,12 @@ class Joiner(AbstractJoiner):
             'ldap_user_gecos = displayName\n' \
             'ldap_user_uuid = entryUUID\n' \
             'ldap_group_uuid = entryUUID\n' \
+            'ldap_group_member = uniqueMember\n' \
+            'ldap_group_object_class = univentionGroup\n' \
+            'ldap_group_name = cn\n' \
+            'ldap_group_gid_number = gidNumber\n' \
+            'ldap_group_nesting_level = 2\n' \
+            'ldap_id_mapping = False\n' \
             'cache_credentials = true\n' \
             'enumerate = true\n' \
             % {
@@ -219,6 +241,48 @@ class Joiner(AbstractJoiner):
         # Restart SSSD
         subprocess.check_call(['systemctl', 'restart', 'sssd'])
         subprocess.check_call(['systemctl', 'enable', 'sssd'])
+    
+    @execute_as_root
+    def _setup_group_mapping(self, ldap_base: str, kerberos_realm: str) -> None:
+        """Configure group mapping for administrative access."""
+        userinfo_logger.info('Configuring group mapping for administrative access')
+        
+        # Create SSSD conf.d directory if it doesn't exist
+        os.makedirs('/etc/sssd/conf.d', exist_ok=True)
+        
+        # Create group mapping configuration
+        group_mapping_conf = \
+            '# Group mapping configuration for UCS domain groups\n' \
+            '# Maps Domain Admins to local wheel group for sudo access\n' \
+            '\n' \
+            '[domain/%(kerberos_realm)s]\n' \
+            '# Map Domain Admins group to wheel group\n' \
+            'ldap_group_external_member = cn=Domain Admins,cn=groups,%(ldap_base)s:wheel\n' \
+            '\n' \
+            '# Additional group mappings can be added here\n' \
+            '# Format: ldap_group_external_member = <LDAP_GROUP_DN>:<LOCAL_GROUP>\n' \
+            % {
+                'kerberos_realm': kerberos_realm,
+                'ldap_base': ldap_base,
+            }
+            
+        with open('/etc/sssd/conf.d/group_mapping.conf', 'w') as conf_file:
+            conf_file.write(group_mapping_conf)
+            
+        # Set proper permissions
+        os.chmod('/etc/sssd/conf.d/group_mapping.conf', 0o600)
+        
+        # Also create a sudoers.d file to ensure wheel group has sudo access
+        sudoers_content = \
+            '# Allow members of wheel group to execute any command\n' \
+            '%wheel ALL=(ALL) ALL\n'
+            
+        with open('/etc/sudoers.d/wheel', 'w') as sudoers_file:
+            sudoers_file.write(sudoers_content)
+            
+        os.chmod('/etc/sudoers.d/wheel', 0o440)
+        
+        userinfo_logger.info('Group mapping configuration completed')
     
     @execute_as_root
     def _setup_pam_rocky(self) -> None:
@@ -245,3 +309,54 @@ class Joiner(AbstractJoiner):
                 subprocess.check_call(['setsebool', '-P', 'authlogin_nsswitch_use_ldap=on'])
         except (subprocess.CalledProcessError, FileNotFoundError) as e:
             userinfo_logger.warning(f'SELinux configuration warning: {e}')
+    
+    @execute_as_root
+    def _verify_group_mapping(self) -> None:
+        """Verify that group mapping configuration is working correctly."""
+        userinfo_logger.info('Verifying group mapping configuration')
+        
+        try:
+            # Test LDAP connection
+            ldap_test_cmd = [
+                'ldapsearch', '-x', '-H', f'ldap://{self.ldap_server_name}:7389',
+                '-b', self.ldap_base, '-s', 'base', '(objectClass=*)'
+            ]
+            subprocess.check_output(ldap_test_cmd, stderr=subprocess.STDOUT)
+            userinfo_logger.info('LDAP connection test: SUCCESS')
+        except subprocess.CalledProcessError as e:
+            userinfo_logger.warning(f'LDAP connection test failed: {e}')
+        
+        try:
+            # Test SSSD domain status
+            sssctl_cmd = ['sssctl', 'domain-status', self.kerberos_realm]
+            subprocess.check_output(sssctl_cmd, stderr=subprocess.STDOUT)
+            userinfo_logger.info('SSSD domain status: SUCCESS')
+        except subprocess.CalledProcessError as e:
+            userinfo_logger.warning(f'SSSD domain status check failed: {e}')
+        
+        try:
+            # Test group lookup for Domain Admins
+            getent_cmd = ['getent', 'group', f'Domain Admins@{self.kerberos_realm}']
+            result = subprocess.check_output(getent_cmd, stderr=subprocess.STDOUT)
+            userinfo_logger.info('Domain Admins group lookup: SUCCESS')
+            userinfo_logger.info(f'Group info: {result.decode().strip()}')
+        except subprocess.CalledProcessError as e:
+            userinfo_logger.warning(f'Domain Admins group lookup failed: {e}')
+            userinfo_logger.warning('This may be normal immediately after setup - try after reboot')
+        
+        # Verify configuration files exist
+        config_files = [
+            '/etc/sssd/sssd.conf',
+            '/etc/sssd/conf.d/group_mapping.conf',
+            '/etc/sudoers.d/wheel',
+            '/etc/openldap/ldap.conf',
+            '/etc/machine.secret'
+        ]
+        
+        for config_file in config_files:
+            if os.path.exists(config_file):
+                userinfo_logger.info(f'Configuration file {config_file}: EXISTS')
+            else:
+                userinfo_logger.warning(f'Configuration file {config_file}: MISSING')
+        
+        userinfo_logger.info('Group mapping verification completed')
