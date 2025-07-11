@@ -16,8 +16,6 @@ Server (UCS) domains. It will perform the following steps for you:
 
 Univention Domain Join supports the following Linux distributions:
 
-- `rocky9`
-  - Rocky Linux 9
 - `rocky8`
   - Rocky Linux 8
 - `ubuntu24.04`
@@ -64,20 +62,23 @@ There is also a command line tool `univention-domain-join-cli`, which can be ins
 with the package `univention-domain-join-cli`.
 Run `sudo univention-domain-join-cli --help` for more details.
 
-## Rocky Linux Installation
+## Rocky Linux 8 Installation
 
-For Rocky Linux, you can use the provided `setup-rocky.sh` script to join the UCS domain using LDAP authentication:
+For Rocky Linux 8, use the provided `setup-rocky8.sh` script to join the UCS domain using Kerberos+LDAP authentication with custom home directory support:
 
 ```shell
-sudo ./setup-rocky.sh
+sudo ./setup-rocky8.sh
 ```
 
 This script will:
-1. Install the necessary packages
-2. Configure LDAP authentication
-3. Set up SSSD for user authentication
-4. Configure PAM for home directory creation
-5. Handle SELinux settings
+1. Install the necessary packages (sssd, krb5, openldap-clients, etc.)
+2. Configure Kerberos authentication matching Ubuntu implementation
+3. Set up SSSD for user/group resolution with identical group mapping
+4. Configure PAM for automatic home directory creation in `/nfs/home`
+5. Handle SELinux settings for LDAP authentication
+6. Create machine account in UCS with proper Rocky Linux identification
+
+The script provides the same group mapping behavior as Ubuntu systems, ensuring consistent user and group resolution across your mixed environment.
 
 # Doc
 
