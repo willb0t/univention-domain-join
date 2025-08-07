@@ -167,13 +167,25 @@ create_computer_account() {
     # Generate random password
     password="$(tr -dc A-Za-z0-9_\!\@\#\$\%\^\&\*\(\)-+ </dev/urandom | head -c20)"
     
+    # Check if computer account already exists
+    if ssh -n root@$REALMDC.$REALMAD udm computers/linux list --filter name=$(hostname) | grep -q "DN: cn=$(hostname),cn=computers,${ldap_base}"; then
+        log "Computer account $(hostname) already exists. Attempting to remove it first..."
+        
+        # Try to remove existing computer account
+        if ssh -n root@$REALMDC.$REALMAD udm computers/linux remove --dn="cn=$(hostname),cn=computers,${ldap_base}"; then
+            log "Existing computer account removed successfully"
+        else
+            handle_error "Failed to remove existing computer account. Please run reset_rocky.sh or manually remove the account first."
+        fi
+    fi
+    
     # Create computer account
     if ! ssh -n root@$REALMDC.$REALMAD udm computers/linux create \
         --position "cn=computers,${ldap_base}" \
         --set name=$(hostname) --set password="${password}" \
         --set operatingSystem="Rocky Linux" \
         --set operatingSystemVersion="$ROCKY_VERSION"; then
-        handle_error "Failed to create computer account on UCS server"
+        handle_error "Failed to create computer account on UCS server. If the account already exists, please run reset_rocky.sh first."
     fi
     
     # Save password

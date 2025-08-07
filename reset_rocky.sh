@@ -55,6 +55,36 @@ if command -v setsebool &> /dev/null; then
     echo "SELinux settings reset."
 fi
 
+echo "===== Removing computer account from UCS server ====="
+# Try to get UCS configuration to remove computer account
+if [ -f /etc/univention/ucr_master ]; then
+    . /etc/univention/ucr_master
+    if [ -n "$master_ip" ] && [ -n "$ldap_base" ]; then
+        echo "Attempting to remove computer account $(hostname) from UCS server..."
+        # Extract just the IP/hostname from master_ip if it contains a full FQDN
+        UCS_SERVER=$(echo "$master_ip" | cut -d'.' -f1-2)
+        if [[ "$master_ip" == *.* ]]; then
+            UCS_SERVER="$master_ip"
+        fi
+        
+        # Try to remove the computer account
+        if ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no -n root@"$UCS_SERVER" \
+            "udm computers/linux remove --dn=\"cn=$(hostname),cn=computers,$ldap_base\"" 2>/dev/null; then
+            echo "Computer account $(hostname) removed from UCS server successfully."
+        else
+            echo "Warning: Could not remove computer account $(hostname) from UCS server."
+            echo "You may need to manually remove it using:"
+            echo "  udm computers/linux remove --dn=\"cn=$(hostname),cn=computers,$ldap_base\""
+        fi
+    else
+        echo "Warning: UCS configuration not found. Cannot remove computer account automatically."
+        echo "You may need to manually remove the computer account $(hostname) from the UCS server."
+    fi
+else
+    echo "Warning: UCS configuration file not found. Cannot remove computer account automatically."
+    echo "You may need to manually remove the computer account $(hostname) from the UCS server."
+fi
+
 echo "===== Cleaning up system cache ====="
 # Clear SSSD cache
 rm -rf /var/lib/sss/db/*
